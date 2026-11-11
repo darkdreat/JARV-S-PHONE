@@ -1,0 +1,1784 @@
+name: Build JARVISbabasi APK
+
+# Tek dosya: Repoya sadece bu dosyayi .github/workflows/build.yml olarak koy.
+# Actions sekmesinden "Run workflow" de, bitince Artifacts'tan APK'yi indir.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Proje dosyalarini olustur
+        run: |
+          set -e
+          mkdir -p jarvis && cd jarvis
+          mkdir -p "app"
+          cat > "app/build.gradle.kts" <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.jarvis.offline"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.jarvis.offline"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+              implementation(composeBom)
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+              implementation("io.coil-kt:coil-compose:2.7.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          JARVIS_EOF
+          mkdir -p "app/src/main"
+          cat > "app/src/main/AndroidManifest.xml" <<'JARVIS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.SET_ALARM" />
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+
+              <queries>
+                  <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>
+                  <intent><action android:name="android.speech.RecognitionService" /></intent>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.Jarvis">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          JARVIS_EOF
+          mkdir -p "app/src/main/java/com/jarvis/offline"
+          cat > "app/src/main/java/com/jarvis/offline/GroqClient.kt" <<'JARVIS_EOF'
+          package com.jarvis.offline
+
+          import android.content.Context
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /**
+           * Groq sohbet istemcisi. Token tüketimini düşük tutmak için:
+           *  - kısa sistem mesajı, en fazla [MAX_TOKENS] cevap tokenı
+           *  - sadece son [HISTORY] mesaj gönderilir
+           * API anahtarı koda gömülmez; uygulamada girilir ve telefonda saklanır.
+           */
+          class GroqClient(context: Context) {
+
+              private val prefs = context.getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+
+              var apiKey: String
+                  get() = prefs.getString("groq_key", "") ?: ""
+                  set(v) = prefs.edit().putString("groq_key", v.trim()).apply()
+
+              var model: String
+                  get() = prefs.getString("groq_model", DEFAULT_MODEL) ?: DEFAULT_MODEL
+                  set(v) = prefs.edit().putString("groq_model", v.trim().ifBlank { DEFAULT_MODEL }).apply()
+
+              val hasKey: Boolean get() = apiKey.isNotBlank()
+
+              private val history = ArrayList<Pair<String, String>>() // (role, content)
+
+              suspend fun ask(prompt: String): String = withContext(Dispatchers.IO) {
+                  if (!hasKey) return@withContext "Önce Groq API anahtarını girmelisiniz efendim."
+
+                  history += "user" to prompt
+                  while (history.size > HISTORY) history.removeAt(0)
+
+                  val messages = JSONArray().put(
+                      JSONObject().put("role", "system").put("content", SYSTEM_PROMPT)
+                  )
+                  history.forEach { (r, c) -> messages.put(JSONObject().put("role", r).put("content", c)) }
+
+                  val body = JSONObject()
+                      .put("model", model)
+                      .put("messages", messages)
+                      .put("max_tokens", MAX_TOKENS)
+                      .put("temperature", 0.7)
+
+                  val conn = (URL("https://api.groq.com/openai/v1/chat/completions").openConnection() as HttpURLConnection)
+                  try {
+                      conn.requestMethod = "POST"
+                      conn.connectTimeout = 15000
+                      conn.readTimeout = 30000
+                      conn.doOutput = true
+                      conn.setRequestProperty("Content-Type", "application/json")
+                      conn.setRequestProperty("Authorization", "Bearer $apiKey")
+                      conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+                      val code = conn.responseCode
+                      if (code !in 200..299) {
+                          history.removeAt(history.lastIndex)
+                          return@withContext when (code) {
+                              401 -> "API anahtarı geçersiz görünüyor efendim."
+                              429 -> "Groq kullanım limiti doldu, biraz bekleyelim."
+                              else -> "Groq hatası ($code)."
+                          }
+                      }
+                      val text = conn.inputStream.bufferedReader().use { it.readText() }
+                      val answer = JSONObject(text)
+                          .getJSONArray("choices").getJSONObject(0)
+                          .getJSONObject("message").getString("content").trim()
+                      history += "assistant" to answer
+                      answer
+                  } catch (e: java.io.IOException) {
+                      history.removeAt(history.lastIndex)
+                      "İnternete ulaşamıyorum efendim."
+                  } finally {
+                      conn.disconnect()
+                  }
+              }
+
+              fun reset() = history.clear()
+
+              companion object {
+                  const val DEFAULT_MODEL = "llama-3.1-8b-instant"
+                  const val MAX_TOKENS = 150
+                  const val HISTORY = 6
+                  const val SYSTEM_PROMPT =
+                      "Sen JARVIS'sin, kullanıcının sesli asistanısın. Her zaman Türkçe, kısa ve net cevap ver " +
+                          "(en fazla 2-3 cümle). Nazik ve hafif esprili ol, kullanıcıya 'efendim' diye hitap et."
+              }
+          }
+          JARVIS_EOF
+          mkdir -p "app/src/main/java/com/jarvis/offline"
+          cat > "app/src/main/java/com/jarvis/offline/JarvisOrb.kt" <<'JARVIS_EOF'
+          package com.jarvis.offline
+
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.layout.aspectRatio
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberUpdatedState
+          import androidx.compose.runtime.setValue
+          import androidx.compose.runtime.withFrameNanos
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import kotlin.math.PI
+          import kotlin.math.cos
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+          import kotlin.random.Random
+
+          enum class JState { IDLE, LISTENING, THINKING, SPEAKING }
+
+          private val Cyan = Color(0xFF00E5FF)
+          private val Ice = Color(0xFFBDF7FF)
+
+          private class Orb(
+              val angle: Float, val radius: Float, val size: Float,
+              val sp1: Float, val sp2: Float, val ph1: Float, val ph2: Float, val alpha: Float
+          )
+
+          /**
+           * İnce bir halka ve içinde yüzen küçük mavi toplar.
+           * Boştayken toplar havada süzülür; dinlerken/konuşurken (ses seviyesine göre) canlanır,
+           * düşünürken halkanın içinde döner.
+           */
+          @Composable
+          fun JarvisOrb(state: JState, level: Float, modifier: Modifier = Modifier) {
+              val orbs = remember {
+                  val rnd = Random(7)
+                  List(46) {
+                      Orb(
+                          angle = rnd.nextFloat() * 2f * PI.toFloat(),
+                          radius = 0.12f + 0.74f * sqrt(rnd.nextFloat()),
+                          size = 0.010f + 0.018f * rnd.nextFloat(),
+                          sp1 = 0.25f + rnd.nextFloat() * 0.6f,
+                          sp2 = 0.25f + rnd.nextFloat() * 0.6f,
+                          ph1 = rnd.nextFloat() * 6.28f,
+                          ph2 = rnd.nextFloat() * 6.28f,
+                          alpha = 0.55f + 0.45f * rnd.nextFloat()
+                      )
+                  }
+              }
+
+              val stateNow by rememberUpdatedState(state)
+              val levelNow by rememberUpdatedState(level)
+              var time by remember { mutableFloatStateOf(0f) }
+              var energy by remember { mutableFloatStateOf(0f) }   // 0..1 canlılık
+              var swirl by remember { mutableFloatStateOf(0f) }    // 0..1 dönme
+
+              LaunchedEffect(Unit) {
+                  var last = 0L
+                  while (true) {
+                      withFrameNanos { now ->
+                          val dt = if (last == 0L) 0.016f else ((now - last) / 1e9f).coerceAtMost(0.05f)
+                          last = now
+                          time += dt
+
+                          // Konuşurken gerçek ses seviyesi yok; doğal görünen yapay bir "ses" üret
+                          val speakingWave = 0.55f + 0.30f * sin(time * 7.3f) * sin(time * 2.9f) + 0.1f * sin(time * 13f)
+                          val targetEnergy = when (stateNow) {
+                              JState.IDLE -> 0f
+                              JState.LISTENING -> maxOf(0.25f, levelNow)
+                              JState.THINKING -> 0.3f
+                              JState.SPEAKING -> speakingWave
+                          }
+                          energy += (targetEnergy - energy) * (dt * 6f).coerceAtMost(1f)
+                          val targetSwirl = if (stateNow == JState.THINKING) 1f else 0f
+                          swirl += (targetSwirl - swirl) * (dt * 3f).coerceAtMost(1f)
+                      }
+                  }
+              }
+
+              Canvas(modifier.fillMaxWidth().aspectRatio(1f)) {
+                  val c = center
+                  val ringR = size.minDimension / 2f * 0.94f
+
+                  // Halkanın dışındaki yumuşak parıltı (enerjiyle nefes alır)
+                  drawCircle(
+                      Brush.radialGradient(
+                          listOf(Color.Transparent, Cyan.copy(alpha = 0.10f + 0.20f * energy), Color.Transparent),
+                          center = c, radius = ringR * 1.12f
+                      ),
+                      radius = ringR * 1.12f
+                  )
+                  // İnce halka
+                  drawCircle(Cyan.copy(alpha = 0.55f + 0.35f * energy), ringR, c, style = Stroke(width = ringR * 0.012f))
+
+                  val swirlAngle = time * 0.9f * swirl
+                  orbs.forEach { o ->
+                      val amp = ringR * (0.035f + 0.075f * energy)
+                      val breathe = 1f + 0.14f * energy * sin(time * 5f + o.ph1)
+                      val r = (o.radius * ringR * breathe).coerceAtMost(ringR * 0.92f)
+                      val a = o.angle + swirlAngle * (0.5f + o.radius)
+                      val x = c.x + cos(a) * r + sin(time * o.sp1 + o.ph1) * amp
+                      val y = c.y + sin(a) * r + cos(time * o.sp2 + o.ph2) * amp
+                      val s = ringR * o.size * (1f + 0.7f * energy)
+                      val p = Offset(x, y)
+
+                      drawCircle(Cyan.copy(alpha = 0.18f * o.alpha + 0.12f * energy), s * 3f, p)   // hale
+                      drawCircle(Cyan.copy(alpha = o.alpha), s * 1.3f, p)
+                      drawCircle(Ice.copy(alpha = o.alpha), s * 0.55f, p)                          // parlak merkez
+                  }
+              }
+          }
+          JARVIS_EOF
+          mkdir -p "app/src/main/java/com/jarvis/offline"
+          cat > "app/src/main/java/com/jarvis/offline/JarvisViewModel.kt" <<'JARVIS_EOF'
+          package com.jarvis.offline
+
+          import android.app.Application
+          import android.net.Uri
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableStateListOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import kotlinx.coroutines.launch
+
+          data class Msg(val fromUser: Boolean, val text: String)
+
+          class JarvisViewModel(app: Application) : AndroidViewModel(app) {
+
+              val messages = mutableStateListOf<Msg>()
+              var jState by mutableStateOf(JState.IDLE)
+              var level by mutableFloatStateOf(0f)
+              var status by mutableStateOf("")
+              var hasKey by mutableStateOf(false)
+              var pickedImage by mutableStateOf<Uri?>(null)
+
+              private val prefs = app.getSharedPreferences("jarvis", android.content.Context.MODE_PRIVATE)
+              var doubleVolumeEnabled by mutableStateOf(prefs.getBoolean("double_volume_enabled", true))
+                  private set
+
+              private val groq = GroqClient(app)
+              private val commands = PhoneCommands(app)
+              private val voice = VoiceIO(
+                  context = app,
+                  onLevel = { level = it },
+                  onHeard = { submit(it) },
+                  onListenEnd = { if (jState == JState.LISTENING) jState = JState.IDLE },
+                  onSpeakStart = { jState = JState.SPEAKING },
+                  onSpeakEnd = { jState = JState.IDLE; level = 0f },
+                  onError = { status = it },
+              )
+
+              init { refreshKeyState() }
+
+              val apiKey: String get() = groq.apiKey
+              val model: String get() = groq.model
+
+              fun saveSettings(key: String, model: String) {
+                  groq.apiKey = key
+                  groq.model = model
+                  refreshKeyState()
+              }
+
+              private fun refreshKeyState() {
+                  hasKey = groq.hasKey
+                  status = if (hasKey) "Hazır. Halkaya dokunup konuşun." else "Groq API anahtarı girin (Ayarlar düğmesi)."
+              }
+
+              fun setDoubleVolumeEnabled(enabled: Boolean) {
+                  doubleVolumeEnabled = enabled
+                  prefs.edit().putBoolean("double_volume_enabled", enabled).apply()
+              }
+
+              fun startListeningFromShortcut() {
+                  if (jState == JState.LISTENING) {
+                      voice.stopListening()
+                      jState = JState.IDLE
+                      status = "Dinleme durduruldu."
+                  } else {
+                      jState = JState.LISTENING
+                      status = "Ses kısma kısayoluyla dinleniyor..."
+                      voice.listen()
+                  }
+              }
+
+              fun toggleListen() {
+                  when (jState) {
+                      JState.LISTENING -> { voice.stopListening(); jState = JState.IDLE }
+                      JState.THINKING -> {}
+                      else -> { jState = JState.LISTENING; voice.listen() }
+                  }
+              }
+
+              fun submit(text: String) {
+                  if (text.isBlank()) return
+                  messages += Msg(true, text)
+
+                  // 1) Telefon komutu mu? Yerel çalışır, Groq'a token harcanmaz.
+                  val local = try { commands.handle(text) } catch (e: Exception) { "Komut çalışmadı: ${e.message}" }
+                  if (local != null) { say(local); return }
+
+                  // 2) Değilse Groq'a sor
+                  if (!hasKey) { say("Önce Groq API anahtarını girmelisiniz efendim."); return }
+                  viewModelScope.launch {
+                      jState = JState.THINKING
+                      val answer = try {
+                          groq.ask(text)
+                      } catch (e: Throwable) {
+                          "Bir hata oluştu: ${e.message}"
+                      }
+                      say(answer.ifBlank { "Anlayamadım efendim." })
+                  }
+              }
+
+              private fun say(text: String) {
+                  messages += Msg(false, text)
+                  voice.speak(text)
+                  if (jState == JState.THINKING) jState = JState.IDLE
+              }
+
+              fun clearChat() { messages.clear(); groq.reset() }
+
+              override fun onCleared() { voice.destroy() }
+          }
+          JARVIS_EOF
+          mkdir -p "app/src/main/java/com/jarvis/offline"
+          cat > "app/src/main/java/com/jarvis/offline/MainActivity.kt" <<'JARVIS_EOF'
+          package com.jarvis.offline
+
+          import android.Manifest
+          import android.content.Context
+          import android.media.AudioManager
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.KeyEvent
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.activity.viewModels
+          import androidx.compose.animation.AnimatedVisibility
+          import androidx.compose.animation.animateContentSize
+          import androidx.compose.animation.core.FastOutSlowInEasing
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.BorderStroke
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.interaction.MutableInteractionSource
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.rememberLazyListState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.DeleteSweep
+          import androidx.compose.material.icons.filled.Image
+          import androidx.compose.material.icons.filled.Settings
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.alpha
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.scale
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.res.painterResource
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import coil.compose.AsyncImage
+
+          private val Cyan = Color(0xFF55E8FF)
+          private val Panel = Color(0xD9081B27)
+          private val Muted = Color(0xFF8BB8C4)
+
+          class MainActivity : ComponentActivity() {
+              private val vm: JarvisViewModel by viewModels()
+              private val keyHandler = Handler(Looper.getMainLooper())
+              private var firstVolumePress = 0L
+              private var pendingVolumeAction: Runnable? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { JarvisScreen(vm) }
+              }
+
+              // Android, uygulama ön plandayken fiziksel ses tuşu olaylarını uygulamaya iletir.
+              // İki hızlı ses kısma basışı dinleme oturumunu açar/kapatır.
+              override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                  if (event.keyCode != KeyEvent.KEYCODE_VOLUME_DOWN || event.action != KeyEvent.ACTION_DOWN ||
+                      event.repeatCount > 0 || !vm.doubleVolumeEnabled
+                  ) return super.dispatchKeyEvent(event)
+
+                  val now = android.os.SystemClock.elapsedRealtime()
+                  if (firstVolumePress != 0L && now - firstVolumePress <= 450L) {
+                      pendingVolumeAction?.let { keyHandler.removeCallbacks(it) }
+                      pendingVolumeAction = null
+                      firstVolumePress = 0L
+                      vm.startListeningFromShortcut()
+                      return true
+                  }
+
+                  firstVolumePress = now
+                  val action = Runnable {
+                      firstVolumePress = 0L
+                      val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, 0)
+                      pendingVolumeAction = null
+                  }
+                  pendingVolumeAction = action
+                  keyHandler.postDelayed(action, 470L)
+                  return true
+              }
+
+              override fun onDestroy() {
+                  pendingVolumeAction?.let { keyHandler.removeCallbacks(it) }
+                  super.onDestroy()
+              }
+          }
+
+          @Composable
+          fun JarvisScreen(vm: JarvisViewModel) {
+              var input by remember { mutableStateOf("") }
+              var showSettings by remember { mutableStateOf(false) }
+              val listState = rememberLazyListState()
+              val context = LocalContext.current
+              val pulse = rememberInfiniteTransition(label = "headerPulse")
+              val headerAlpha by pulse.animateFloat(
+                  initialValue = 0.72f, targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(1700, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+                  label = "headerAlpha"
+              )
+
+              val perms = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
+              val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  vm.pickedImage = uri
+              }
+
+              LaunchedEffect(Unit) {
+                  perms.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_CONTACTS))
+              }
+              LaunchedEffect(vm.messages.size) {
+                  if (vm.messages.isNotEmpty()) listState.animateScrollToItem(vm.messages.lastIndex)
+              }
+
+              Box(Modifier.fillMaxSize().background(Color(0xFF030A12))) {
+                  Image(
+                      painter = painterResource(R.drawable.jarvis_background),
+                      contentDescription = "JARVIS arka plan görseli",
+                      contentScale = ContentScale.Crop,
+                      modifier = Modifier.fillMaxSize().alpha(0.48f)
+                  )
+                  Box(Modifier.fillMaxSize().background(Color(0xA8030A12)))
+                  Column(
+                      Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 10.dp),
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      Row(
+                          Modifier.fillMaxWidth().padding(bottom = 3.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                          horizontalArrangement = Arrangement.SpaceBetween
+                      ) {
+                          Column {
+                              Text("J.A.R.V.I.S", color = Cyan.copy(alpha = headerAlpha), fontSize = 23.sp, letterSpacing = 5.sp)
+                              Text("PERSONAL AI SYSTEM", color = Muted, fontSize = 9.sp, letterSpacing = 2.sp)
+                          }
+                          IconButton(
+                              onClick = { showSettings = true },
+                              modifier = Modifier.size(44.dp).clip(CircleShape)
+                                  .background(Panel).border(1.dp, Cyan.copy(alpha = .55f), CircleShape)
+                          ) {
+                              Icon(Icons.Filled.Settings, contentDescription = "Ayarlar", tint = Cyan)
+                          }
+                      }
+
+                      Box(
+                          Modifier.fillMaxWidth(0.68f).padding(vertical = 5.dp)
+                              .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
+                                  vm.toggleListen()
+                              }
+                      ) { JarvisOrb(vm.jState, vm.level) }
+
+                      AnimatedVisibility(visible = true) {
+                          Text(
+                              vm.status.ifBlank { "Hazır. Dinlemek için merkeze dokunun." },
+                              color = if (vm.jState == JState.LISTENING) Color(0xFF7CFFCE) else Cyan.copy(alpha = .8f),
+                              fontSize = 11.sp,
+                              modifier = Modifier.padding(bottom = 4.dp)
+                          )
+                      }
+
+                      AnimatedVisibility(visible = vm.pickedImage != null) {
+                          vm.pickedImage?.let { uri ->
+                              AsyncImage(
+                                  model = uri, contentDescription = "Seçilen görsel", contentScale = ContentScale.Crop,
+                                  modifier = Modifier.padding(top = 5.dp).fillMaxWidth().height(82.dp)
+                                      .clip(RoundedCornerShape(12.dp)).border(1.dp, Cyan.copy(alpha = .7f), RoundedCornerShape(12.dp))
+                              )
+                          }
+                      }
+
+                      LazyColumn(
+                          state = listState,
+                          modifier = Modifier.weight(1f).fillMaxWidth().padding(top = 7.dp)
+                              .clip(RoundedCornerShape(18.dp)).background(Color(0x44081722)).padding(8.dp),
+                          verticalArrangement = Arrangement.spacedBy(7.dp)
+                      ) {
+                          items(vm.messages) { m ->
+                              Row(
+                                  Modifier.fillMaxWidth(),
+                                  horizontalArrangement = if (m.fromUser) Arrangement.End else Arrangement.Start
+                              ) {
+                                  Text(
+                                      m.text,
+                                      color = if (m.fromUser) Color.White else Cyan,
+                                      modifier = Modifier.widthIn(max = 300.dp).animateContentSize()
+                                          .background(if (m.fromUser) Color(0xCC124052) else Panel, RoundedCornerShape(15.dp))
+                                          .border(1.dp, Cyan.copy(alpha = if (m.fromUser) .34f else .2f), RoundedCornerShape(15.dp))
+                                          .padding(horizontal = 13.dp, vertical = 10.dp),
+                                      fontSize = 14.sp
+                                  )
+                              }
+                          }
+                      }
+
+                      Row(
+                          Modifier.fillMaxWidth().padding(vertical = 7.dp),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp)
+                      ) {
+                          OutlinedButton(
+                              onClick = { imagePicker.launch("image/*") },
+                              border = BorderStroke(1.dp, Cyan.copy(alpha = .65f)),
+                              modifier = Modifier.weight(1f), contentPadding = PaddingValues(5.dp)
+                          ) {
+                              Icon(Icons.Filled.Image, contentDescription = null, tint = Cyan, modifier = Modifier.size(17.dp))
+                              Spacer(Modifier.width(5.dp)); Text("Görsel", color = Cyan, fontSize = 11.sp)
+                          }
+                          OutlinedButton(
+                              onClick = { vm.clearChat() },
+                              border = BorderStroke(1.dp, Cyan.copy(alpha = .65f)),
+                              modifier = Modifier.weight(1f), contentPadding = PaddingValues(5.dp)
+                          ) {
+                              Icon(Icons.Filled.DeleteSweep, contentDescription = null, tint = Cyan, modifier = Modifier.size(17.dp))
+                              Spacer(Modifier.width(5.dp)); Text("Temizle", color = Cyan, fontSize = 11.sp)
+                          }
+                      }
+
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          OutlinedTextField(
+                              value = input, onValueChange = { input = it },
+                              placeholder = { Text("Komutunuzu yazın...", color = Muted) },
+                              modifier = Modifier.weight(1f), singleLine = true,
+                              shape = RoundedCornerShape(16.dp), colors = fieldColors()
+                          )
+                          Button(
+                              onClick = { vm.submit(input); input = "" },
+                              colors = ButtonDefaults.buttonColors(containerColor = Cyan, contentColor = Color(0xFF001018)),
+                              shape = RoundedCornerShape(14.dp), modifier = Modifier.padding(start = 7.dp).height(54.dp)
+                          ) { Text("Gönder", fontSize = 12.sp) }
+                      }
+                  }
+              }
+
+              if (showSettings) {
+                  var key by remember { mutableStateOf(vm.apiKey) }
+                  var model by remember { mutableStateOf(vm.model) }
+                  var doublePress by remember { mutableStateOf(vm.doubleVolumeEnabled) }
+                  AlertDialog(
+                      onDismissRequest = { showSettings = false },
+                      containerColor = Color(0xFF071722),
+                      title = {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Icon(Icons.Filled.Settings, contentDescription = null, tint = Cyan)
+                              Spacer(Modifier.width(9.dp))
+                              Text("Sistem ayarları", color = Cyan)
+                          }
+                      },
+                      text = {
+                          Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                              Text("GROQ BAĞLANTISI", color = Muted, fontSize = 10.sp, letterSpacing = 1.5.sp)
+                              OutlinedTextField(
+                                  value = key, onValueChange = { key = it }, singleLine = true,
+                                  label = { Text("API anahtarı", color = Muted) },
+                                  visualTransformation = PasswordVisualTransformation(), colors = fieldColors()
+                              )
+                              OutlinedTextField(
+                                  value = model, onValueChange = { model = it }, singleLine = true,
+                                  label = { Text("Model", color = Muted) }, colors = fieldColors()
+                              )
+                              Divider(color = Cyan.copy(alpha = .2f))
+                              Text("HIZLI ERİŞİM", color = Muted, fontSize = 10.sp, letterSpacing = 1.5.sp)
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Column(Modifier.weight(1f)) {
+                                      Text("Çift ses kısma", color = Color.White, fontSize = 14.sp)
+                                      Text("İki kez basınca JARVIS dinlemeye başlar", color = Muted, fontSize = 11.sp)
+                                  }
+                                  Switch(
+                                      checked = doublePress,
+                                      onCheckedChange = { doublePress = it },
+                                      colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = Cyan)
+                                  )
+                              }
+                              Text(
+                                  "Kısayol yalnızca uygulama ekrandayken çalışır. Mikrofon göstergesi Android tarafından gösterilir.",
+                                  color = Muted, fontSize = 10.sp
+                              )
+                          }
+                      },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              vm.saveSettings(key, model)
+                              vm.setDoubleVolumeEnabled(doublePress)
+                              showSettings = false
+                          }) { Text("Kaydet", color = Cyan) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { showSettings = false }) { Text("İptal", color = Muted) }
+                      }
+                  )
+              }
+          }
+
+          @Composable
+          private fun fieldColors() = OutlinedTextFieldDefaults.colors(
+              focusedTextColor = Color.White, unfocusedTextColor = Color.White,
+              focusedBorderColor = Cyan, unfocusedBorderColor = Cyan.copy(alpha = 0.35f),
+              cursorColor = Cyan, focusedLabelColor = Cyan
+          )
+          JARVIS_EOF
+          mkdir -p "app/src/main/java/com/jarvis/offline"
+          cat > "app/src/main/java/com/jarvis/offline/PhoneCommands.kt" <<'JARVIS_EOF'
+          package com.jarvis.offline
+
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.BatteryManager
+          import android.provider.AlarmClock
+          import android.provider.ContactsContract
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import android.view.KeyEvent
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /**
+           * Telefon kontrolleri. Hızlı, kural tabanlı ve tamamen yerel çalışır.
+           * [handle] komutu tanırsa cevap metnini döndürür; tanımazsa null (bu durumda LLM'e gider).
+           */
+          class PhoneCommands(private val ctx: Context) {
+
+              private val tr = Locale("tr", "TR")
+              private var torchOn = false
+
+              fun handle(raw: String): String? {
+                  val t = raw.lowercase(tr).trim()
+
+                  return when {
+                      // --- Bilgi ---
+                      "saat kaç" in t -> "Saat ${SimpleDateFormat("HH:mm", tr).format(Date())} efendim."
+                      "bugün ne" in t || "tarih" in t ->
+                          SimpleDateFormat("d MMMM yyyy EEEE", tr).format(Date()) + " efendim."
+                      "pil" in t || "şarj" in t || "batarya" in t -> battery()
+
+                      // --- Fener ---
+                      "fener" in t || "el feneri" in t -> torch(on = !("kapat" in t || "söndür" in t))
+
+                      // --- Ses ---
+                      "sesi aç" in t || "sesi yükselt" in t || "sesi artır" in t -> volume(+1)
+                      "sesi kıs" in t || "sesi azalt" in t || "sesi düşür" in t -> volume(-1)
+                      "sessiz" in t -> { audio().ringerMode = AudioManager.RINGER_MODE_SILENT; "Telefon sessize alındı." }
+                      "müziği durdur" in t || "müzik dur" in t || "duraklat" in t -> media(KeyEvent.KEYCODE_MEDIA_PAUSE, "Müzik durduruldu.")
+                      "müziği başlat" in t || "müziğe devam" in t || "devam et" in t -> media(KeyEvent.KEYCODE_MEDIA_PLAY, "Müzik devam ediyor.")
+                      "sonraki şarkı" in t || "sıradaki" in t -> media(KeyEvent.KEYCODE_MEDIA_NEXT, "Sıradaki şarkı.")
+                      "önceki şarkı" in t -> media(KeyEvent.KEYCODE_MEDIA_PREVIOUS, "Önceki şarkı.")
+
+                      // --- Parlaklık ---
+                      "parlaklık" in t -> brightness(t)
+
+                      // --- Alarm / zamanlayıcı ---
+                      "alarm" in t && Regex("""\d{1,2}[:.]\d{2}|saat \d{1,2}""").containsMatchIn(t) -> alarm(t)
+                      "zamanlayıcı" in t || "sayaç" in t || "dakika sonra" in t -> timer(t)
+
+                      // --- Aramalar / mesaj ---
+                      t.startsWith("ara ") || t.endsWith(" ara") || " arar mısın" in t -> call(t)
+                      t.startsWith("sms ") || "mesaj yaz" in t -> sms(t)
+
+                      // --- Kamera / ayarlar ---
+                      "kamera" in t || "fotoğraf çek" in t -> {
+                          start(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)); "Kamera açılıyor."
+                      }
+                      "wifi" in t || "wi-fi" in t || "internet ayar" in t -> {
+                          start(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY)); "İnternet paneli açıldı."
+                      }
+                      "bluetooth" in t -> { start(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)); "Bluetooth ayarları açıldı." }
+                      "ayarlar" in t -> { start(Intent(Settings.ACTION_SETTINGS)); "Ayarlar açılıyor." }
+
+                      // --- Uygulama aç ---
+                      t.endsWith(" aç") || t.endsWith(" başlat") || t.startsWith("aç ") -> openApp(t)
+
+                      else -> null
+                  }
+              }
+
+              // ---------- yardımcılar ----------
+
+              private fun start(i: Intent) = ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+              private fun audio() = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+              private fun battery(): String {
+                  val i = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  val level = i?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                  val scale = i?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+                  val status = i?.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                  val charging = status == BatteryManager.BATTERY_STATUS_CHARGING
+                  val pct = if (level >= 0) level * 100 / scale else return "Pil bilgisine ulaşamadım."
+                  return "Pil yüzde $pct" + if (charging) ", şu an şarj oluyor." else "."
+              }
+
+              private fun torch(on: Boolean): String = try {
+                  val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                  val id = cm.cameraIdList.first {
+                      cm.getCameraCharacteristics(it)
+                          .get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                  }
+                  cm.setTorchMode(id, on); torchOn = on
+                  if (on) "Fener açıldı." else "Fener kapatıldı."
+              } catch (e: Exception) { "Fenere erişemedim." }
+
+              private fun volume(dir: Int): String {
+                  val a = audio()
+                  repeat(3) {
+                      a.adjustStreamVolume(
+                          AudioManager.STREAM_MUSIC,
+                          if (dir > 0) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+                          AudioManager.FLAG_SHOW_UI
+                      )
+                  }
+                  return if (dir > 0) "Ses yükseltildi." else "Ses kısıldı."
+              }
+
+              private fun media(key: Int, reply: String): String {
+                  val a = audio()
+                  a.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, key))
+                  a.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, key))
+                  return reply
+              }
+
+              private fun brightness(t: String): String {
+                  val pct = Regex("""\d{1,3}""").find(t)?.value?.toIntOrNull()?.coerceIn(1, 100)
+                      ?: return "Kaç yüzde olsun efendim?"
+                  if (!Settings.System.canWrite(ctx)) {
+                      start(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:${ctx.packageName}")))
+                      return "Parlaklığı değiştirmem için izin vermeniz gerekiyor."
+                  }
+                  Settings.System.putInt(ctx.contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE, 0)
+                  Settings.System.putInt(ctx.contentResolver, Settings.System.SCREEN_BRIGHTNESS, pct * 255 / 100)
+                  return "Parlaklık yüzde $pct yapıldı."
+              }
+
+              private fun alarm(t: String): String {
+                  val m = Regex("""(\d{1,2})[:.](\d{2})""").find(t)
+                  val (h, min) = if (m != null) m.groupValues[1].toInt() to m.groupValues[2].toInt()
+                  else (Regex("""saat (\d{1,2})""").find(t)?.groupValues?.get(1)?.toInt() ?: return "Saati anlayamadım.") to 0
+                  if (h > 23 || min > 59) return "Geçersiz saat."
+                  start(Intent(AlarmClock.ACTION_SET_ALARM).apply {
+                      putExtra(AlarmClock.EXTRA_HOUR, h)
+                      putExtra(AlarmClock.EXTRA_MINUTES, min)
+                      putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                  })
+                  return "Alarm %02d:%02d için kuruldu.".format(h, min)
+              }
+
+              private fun timer(t: String): String {
+                  val n = Regex("""\d+""").find(t)?.value?.toIntOrNull() ?: return "Kaç dakika olsun efendim?"
+                  val seconds = if ("saniye" in t) n else n * 60
+                  start(Intent(AlarmClock.ACTION_SET_TIMER).apply {
+                      putExtra(AlarmClock.EXTRA_LENGTH, seconds)
+                      putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                  })
+                  return if ("saniye" in t) "$n saniyelik zamanlayıcı başladı." else "$n dakikalık zamanlayıcı başladı."
+              }
+
+              private fun call(t: String): String {
+                  val target = t.removePrefix("ara ").removeSuffix(" ara").replace(" arar mısın", "").trim()
+                  val number = if (target.any { it.isDigit() }) target.filter { it.isDigit() || it == '+' }
+                  else findContact(target) ?: return "$target adında bir kişi bulamadım."
+                  start(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")))
+                  return "$target aranıyor, çevirici açıldı."
+              }
+
+              private fun sms(t: String): String {
+                  // Örnek: "sms 5551234567 yoldayım"
+                  val m = Regex("""sms\s+(\S+)\s+(.+)""").find(t) ?: return "Şöyle söyleyin: sms numara mesaj."
+                  val target = m.groupValues[1]
+                  val number = if (target.any { it.isDigit() }) target else findContact(target)
+                      ?: return "$target bulunamadı."
+                  // Göndermeden önce ekranda onay/düzenleme için açılır.
+                  start(Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$number")).putExtra("sms_body", m.groupValues[2]))
+                  return "Mesaj hazır, göndermeden önce kontrol edebilirsiniz."
+              }
+
+              private fun findContact(name: String): String? = try {
+                  ctx.contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(
+                          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                          ContactsContract.CommonDataKinds.Phone.NUMBER
+                      ), null, null, null
+                  )?.use { c ->
+                      var found: String? = null
+                      while (c.moveToNext() && found == null) {
+                          if (c.getString(0).lowercase(tr).contains(name.lowercase(tr))) found = c.getString(1)
+                      }
+                      found
+                  }
+              } catch (e: SecurityException) { null }
+
+              private fun openApp(t: String): String {
+                  val name = t.removeSuffix(" aç").removeSuffix(" başlat").removePrefix("aç ").trim()
+                  val pm = ctx.packageManager
+                  val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val app = pm.queryIntentActivities(launcher, 0).firstOrNull {
+                      it.loadLabel(pm).toString().lowercase(tr).contains(name)
+                  } ?: return "$name uygulamasını bulamadım."
+                  pm.getLaunchIntentForPackage(app.activityInfo.packageName)?.let { start(it) }
+                  return "${app.loadLabel(pm)} açılıyor."
+              }
+          }
+          JARVIS_EOF
+          mkdir -p "app/src/main/java/com/jarvis/offline"
+          cat > "app/src/main/java/com/jarvis/offline/VoiceIO.kt" <<'JARVIS_EOF'
+          package com.jarvis.offline
+
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import java.util.Locale
+
+          /**
+           * Konuşma tanıma + sesli cevap.
+           * İnternetsiz çalışması için telefonda Türkçe çevrimdışı ses paketleri kurulu olmalı:
+           *  - Konuşma tanıma: Google uygulaması > Ayarlar > Ses > Çevrimdışı konuşma tanıma > Türkçe
+           *  - Sesli okuma: Ayarlar > Genel yönetim > Metinden konuşmaya > Türkçe ses verisi
+           */
+          class VoiceIO(
+              private val context: Context,
+              private val onLevel: (Float) -> Unit,
+              private val onHeard: (String) -> Unit,
+              private val onListenEnd: () -> Unit,
+              private val onSpeakStart: () -> Unit,
+              private val onSpeakEnd: () -> Unit,
+              private val onError: (String) -> Unit,
+          ) {
+              private var recognizer: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+
+              init {
+                  tts = TextToSpeech(context) { status ->
+                      if (status == TextToSpeech.SUCCESS) {
+                          tts?.language = Locale("tr", "TR")
+                          tts?.setSpeechRate(0.97f)
+                          tts?.setPitch(0.9f)
+                          tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                              override fun onStart(id: String?) = onSpeakStart()
+                              override fun onDone(id: String?) = onSpeakEnd()
+                              @Deprecated("Deprecated in Java")
+                              override fun onError(id: String?) = onSpeakEnd()
+                          })
+                          ttsReady = true
+                      }
+                  }
+              }
+
+              fun listen() {
+                  stopSpeaking()
+                  if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+                      onError("Bu telefonda konuşma tanıma servisi yok.")
+                      onListenEnd(); return
+                  }
+                  recognizer?.destroy()
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
+                      setRecognitionListener(object : RecognitionListener {
+                          override fun onReadyForSpeech(p: Bundle?) {}
+                          override fun onBeginningOfSpeech() {}
+                          override fun onRmsChanged(rms: Float) {
+                              onLevel(((rms + 2f) / 12f).coerceIn(0f, 1f))
+                          }
+                          override fun onBufferReceived(b: ByteArray?) {}
+                          override fun onEndOfSpeech() { onLevel(0f) }
+                          override fun onError(error: Int) {
+                              onListenEnd()
+                              if (error != SpeechRecognizer.ERROR_NO_MATCH &&
+                                  error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                              ) onError("Ses tanıma hatası ($error). Çevrimdışı Türkçe paket kurulu mu?")
+                          }
+                          override fun onResults(results: Bundle?) {
+                              val text = results
+                                  ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                  ?.firstOrNull()
+                              onListenEnd()
+                              if (!text.isNullOrBlank()) onHeard(text)
+                          }
+                          override fun onPartialResults(p: Bundle?) {}
+                          override fun onEvent(t: Int, p: Bundle?) {}
+                      })
+                      startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE, "tr-TR")
+                      })
+                  }
+              }
+
+              fun stopListening() { recognizer?.stopListening(); onLevel(0f) }
+
+              fun speak(text: String) {
+                  if (!ttsReady) { onSpeakEnd(); return }
+                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "jarvis")
+              }
+
+              fun stopSpeaking() { tts?.stop() }
+
+              fun destroy() {
+                  recognizer?.destroy()
+                  tts?.shutdown()
+              }
+          }
+          JARVIS_EOF
+          mkdir -p "app/src/main/res/drawable"
+          base64 -d > "app/src/main/res/drawable/jarvis_background.jpg" <<'JARVIS_B64_EOF'
+          /9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMU
+          FRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU
+          FBQUFBQUFBT/wAARCAZAA4QDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUF
+          BAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVW
+          V1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi
+          4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAEC
+          AxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVm
+          Z2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq
+          8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD8u1FLRRXWc4UUUoGaoliqKWiikhBRRRTAKcBTQM0+gkKKKKaAKKKKoAooooAAM06gDFFB
+          LCiinAYoEKBiiiigAooooJCiinAVQgAxS0UUwCigjBooAKKKntDGkwMo3J6UAQgUtPmKGVigwmeKZQAUUUUAFFFFABRSgZpQMU9g
+          uAWloooJCiiimAUUUUAFFFFABRS7aXbQA2inYpaAG7TRtp1FAribRRgUtFMLiYoxS0UBcTFGKWigLiYowKWiiwCbRSbadRRYY3aa
+          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
+          KKLgFFFFK4ARjHvRRRRcAooopFWCiikJxQMOlITmkJzRQAU8SnGGG4UyigVrjyob7px7GmEEdeKKUS9iNwoDUYTmkqTar/dOD6Gm
+          shXqKkpMbRRRSGFFFFABRRRQAU0nNKTSUmykFFFITikMCcU2iinsAUUUUgCiimk0gAnNJRRQUFFFFDAKQmgmkpCQUUUUigooooAR
+          qbSnrSUFIKKKCcUmAhNNoopgFFFFTcBtOptOHSkUwooooJHKaWmg4NOoAKUMR3pKKYD9x9TS7j6mmA1IY2CBipCnvjimTYbRRRTA
+          KVTSUUAOooooAKKKKACng5plKDiqAdRRRTAKKKKCWgpwOabSg4oEOooooAUGlptKDiqE0LRRRQSFFFFABRRRTAKcDTaKAH0U0HFO
+          zmmSFFFFMAoooqbAGcUu6koouA6lplLk07isOopN1GaYrC0UUUCCiiigAooooAKKKKACiiigAooooAKKKKACiiigdgoopM0DFopN
+          1ITmgYpNNoooAKKKKACiimk0ABNJRRUlBT1kZfcehplFAbknyP8A7JprIV9x602lDFehoFZoSin7lbqMH1FIU9DmgdxtBOKKaTmp
+          YwooppNIoCaSiinsAUUUUgCiikJoACabRRSKCiiigYUE4oJxTetJCCiiihjCiiikAUhOBS01jSBCUUUUygppOaUmm0gCiiihgFFF
+          FSA2lHWkopIsdRRRTICnA5FNpVoAdRRRQADg10t34gtJ9CS1S3AmHGcdK5qgHFWmTKKluPooooAKKKKAFU0tNp1ABRRRQAUUUU0A
+          oNOplOBqgFooooAKKKKCWhQadTKcDmgQtFFFAADinZzTaOlUKw6igHNFBIUUUUAFFFFMAooopgODUtMpQcUCsOopA1LTEFFFFKwB
+          RRRSsAUUUUAGaXcaSii4hd1LuFNop3Cw7IoptFFwsPoplFO4WH0UyigLD6Sm0UrgOyKMim0UXGLuo3UlFFwDNFFFMAooooAKKKKA
+          Ciimk5pABOaSiikUFFFFIAooooAKKKKACiignFDAUv2IzSbVbocfWm00mkVYV1YdRxTacsjL3p25G6jB9qYEdFP8sH7rA0hRl6ip
+          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
+          AKKKKACiiiqAKKKKkAooooAKKKKACiiigD//2Q==
+          JARVIS_B64_EOF
+          mkdir -p "app/src/main/res/values"
+          cat > "app/src/main/res/values/strings.xml" <<'JARVIS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">JARVIS Offline</string>
+          </resources>
+          JARVIS_EOF
+          mkdir -p "app/src/main/res/values"
+          cat > "app/src/main/res/values/themes.xml" <<'JARVIS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.Jarvis" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:statusBarColor">@android:color/black</item>
+                  <item name="android:navigationBarColor">@android:color/black</item>
+              </style>
+          </resources>
+          JARVIS_EOF
+          cat > "build.gradle.kts" <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application") version "8.7.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          JARVIS_EOF
+          cat > "gradle.properties" <<'JARVIS_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          JARVIS_EOF
+          cat > "settings.gradle.kts" <<'JARVIS_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "JarvisOffline"
+          include(":app")
+          JARVIS_EOF
+
+      - name: Java 17 hazirla
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle hazirla
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: APK olustur
+        working-directory: jarvis
+        run: gradle assembleDebug --no-daemon
+
+      - name: APK yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: JARVIS-APK
+          path: jarvis/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
