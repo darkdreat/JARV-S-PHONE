@@ -1,0 +1,616 @@
+name: Galaxy Booster Ultimate 2.1 APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Projeyi olustur
+        run: |
+          set -e
+          P=GalaxyBooster
+          K=$P/app/src/main/java/com/galaxy/booster
+          R=$P/app/src/main/res
+          mkdir -p $K $R/mipmap-xxxhdpi $R/drawable-nodpi $R/values $R/xml $R/layout
+
+          cat > $P/settings.gradle.kts <<'EOF'
+          pluginManagement{repositories{google();mavenCentral();gradlePluginPortal()}}
+          dependencyResolutionManagement{repositories{google();mavenCentral()}}
+          rootProject.name="GalaxyBooster"
+          include(":app")
+          EOF
+          cat > $P/build.gradle.kts <<'EOF'
+          plugins{
+           id("com.android.application") version "8.5.2" apply false
+           id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          printf 'org.gradle.jvmargs=-Xmx2g\nandroid.nonTransitiveRClass=true\n' > $P/gradle.properties
+          cat > $P/app/build.gradle.kts <<'EOF'
+          plugins{id("com.android.application");id("org.jetbrains.kotlin.android")}
+          android{
+           namespace="com.galaxy.booster";compileSdk=34
+           defaultConfig{applicationId="com.galaxy.booster";minSdk=26;targetSdk=34;versionCode=3;versionName="2.1"}
+           compileOptions{sourceCompatibility=JavaVersion.VERSION_17;targetCompatibility=JavaVersion.VERSION_17}
+           kotlinOptions{jvmTarget="17"}
+          }
+          EOF
+          cat > $R/values/styles.xml <<'EOF'
+          <resources><string name="app_name">Galaxy Booster</string>
+          <style name="T" parent="android:Theme.Material.NoActionBar"/></resources>
+          EOF
+
+          cat > $P/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+           <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+           <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS"/>
+           <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+           <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+           <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+           <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+           <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+           <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+           <uses-permission android:name="android.permission.WAKE_LOCK"/>
+           <uses-permission android:name="android.permission.INTERNET"/>
+           <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+           <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+           <uses-permission android:name="android.permission.CAMERA"/>
+           <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+           <application android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher" android:theme="@style/T">
+            <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask">
+             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+            </activity>
+            <receiver android:name=".GalaxyClockWidget" android:exported="true" android:permission="android.permission.BIND_APPWIDGET">
+             <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE"/><action android:name="android.intent.action.TIME_TICK"/><action android:name="android.intent.action.TIME_CHANGED"/></intent-filter>
+             <meta-data android:name="android.appwidget.provider" android:resource="@xml/galaxy_clock_widget"/>
+            </receiver>
+            <service android:name=".KeepService" android:exported="false" android:foregroundServiceType="mediaPlayback"/>
+            <receiver android:name=".SessRx" android:exported="true">
+             <intent-filter>
+              <action android:name="android.media.action.OPEN_AUDIO_EFFECT_CONTROL_SESSION"/>
+              <action android:name="android.media.action.CLOSE_AUDIO_EFFECT_CONTROL_SESSION"/>
+             </intent-filter>
+            </receiver>
+           </application>
+          </manifest>
+          EOF
+          cat > $R/xml/galaxy_clock_widget.xml <<'EOF'
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="150dp" android:minHeight="70dp"
+              android:updatePeriodMillis="1800000" android:initialLayout="@layout/galaxy_clock_widget"
+              android:resizeMode="horizontal|vertical" android:widgetCategory="home_screen" />
+          EOF
+          cat > $R/layout/galaxy_clock_widget.xml <<'EOF'
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/clock_root" android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:gravity="center" android:padding="10dp"
+              android:background="#E6190B32">
+              <TextView android:id="@+id/clock_time" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:text="00:00" android:textColor="#E9D5FF" android:textSize="30sp" android:textStyle="bold" />
+              <TextView android:id="@+id/clock_date" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:text="Galaxy Booster" android:textColor="#C4A7F5" android:textSize="12sp" />
+          </LinearLayout>
+          EOF
+
+          cat > $K/Fx.kt <<'EOF'
+          package com.galaxy.booster
+          import android.content.*
+          import android.media.audiofx.AudioEffect
+          import android.media.audiofx.LoudnessEnhancer
+          import kotlin.math.*
+
+          object Fx {
+              var gain = 100
+              var ready = false
+              val sess = HashMap<Int, LoudnessEnhancer>()
+              val pkgs = HashMap<Int, String>()
+              var g0: LoudnessEnhancer? = null
+              fun init(c: Context) { if (!ready) { ready = true; gain = c.getSharedPreferences("gb", 0).getInt("gain", 100) } }
+              fun save(c: Context) { c.getSharedPreferences("gb", 0).edit().putInt("gain", gain).apply() }
+              fun mB(): Int = max(0, (2000 * log10(max(gain, 1) / 100.0)).toInt())
+              fun add(id: Int, pkg: String?) {
+                  if (id <= 0) return
+                  try { sess.remove(id)?.release(); sess[id] = LoudnessEnhancer(id).also { it.setTargetGain(mB()); it.enabled = true }; pkgs[id] = pkg ?: "?" } catch (e: Exception) {}
+              }
+              fun remove(id: Int) { try { sess.remove(id)?.release() } catch (e: Exception) {}; pkgs.remove(id) }
+              fun setGlobal(on: Boolean): Boolean {
+                  try { g0?.release(); g0 = null; if (on) g0 = LoudnessEnhancer(0).also { it.setTargetGain(mB()); it.enabled = true } } catch (e: Exception) { g0 = null; return false }
+                  return true
+              }
+              fun apply() {
+                  sess.values.forEach { try { it.setTargetGain(mB()) } catch (e: Exception) {} }
+                  try { g0?.setTargetGain(mB()) } catch (e: Exception) {}
+              }
+          }
+
+          class GalaxyClockWidget : android.appwidget.AppWidgetProvider() {
+              override fun onUpdate(c: Context, m: android.appwidget.AppWidgetManager, ids: IntArray) {
+                  ids.forEach { id ->
+                      val v = android.widget.RemoteViews(c.packageName, R.layout.galaxy_clock_widget)
+                      val now = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+                      val date = java.text.SimpleDateFormat("EEE, dd MMM", java.util.Locale.getDefault()).format(java.util.Date())
+                      v.setTextViewText(R.id.clock_time, now); v.setTextViewText(R.id.clock_date, date)
+                      val pi = android.app.PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
+                      v.setOnClickPendingIntent(R.id.clock_root, pi); m.updateAppWidget(id, v)
+                  }
+              }
+              override fun onReceive(c: Context, i: Intent) { super.onReceive(c, i); if (i.action == Intent.ACTION_TIME_CHANGED || i.action == Intent.ACTION_TIMEZONE_CHANGED) { val m = android.appwidget.AppWidgetManager.getInstance(c); onUpdate(c, m, m.getAppWidgetIds(android.content.ComponentName(c, GalaxyClockWidget::class.java))) } }
+          }
+
+          class SessRx : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  Fx.init(c)
+                  val id = i.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0)
+                  if (i.action == AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION) Fx.add(id, i.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME))
+                  else if (i.action == AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION) Fx.remove(id)
+              }
+          }
+          EOF
+
+          cat > $K/KeepService.kt <<'EOF'
+          package com.galaxy.booster
+          import android.app.*
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.media.audiofx.AudioEffect
+          import android.os.Build
+          import android.os.IBinder
+          class KeepService : Service() {
+              val rx = SessRx()
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onCreate() {
+                  super.onCreate()
+                  val f = IntentFilter().apply { addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION); addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION) }
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, f, RECEIVER_EXPORTED) else registerReceiver(rx, f)
+              }
+              override fun onStartCommand(i: Intent?, fl: Int, id: Int): Int {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(NotificationChannel("gb", "Galaxy Booster", NotificationManager.IMPORTANCE_LOW))
+                  val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  val n = Notification.Builder(this, "gb").setContentTitle("Galaxy Booster çalışıyor").setSmallIcon(android.R.drawable.ic_media_play).setContentIntent(pi).build()
+                  if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK) else startForeground(1, n)
+                  return START_STICKY
+              }
+              override fun onDestroy() { try { unregisterReceiver(rx) } catch (e: Exception) {}; super.onDestroy() }
+          }
+          EOF
+
+          cat > $K/MainActivity.kt <<'EOF'
+          package com.galaxy.booster
+          import android.Manifest
+          import android.animation.*
+          import android.app.Activity
+          import android.content.ContentUris
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.res.ColorStateList
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.media.*
+          import android.media.audiofx.*
+          import android.media.session.MediaSession
+          import android.media.session.PlaybackState
+          import android.net.Uri
+          import android.os.*
+          import android.provider.MediaStore
+          import android.telecom.TelecomManager
+          import android.telephony.TelephonyManager
+          import android.view.*
+          import android.view.animation.LinearInterpolator
+          import android.widget.*
+          import kotlin.math.*
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import android.net.wifi.WifiManager
+          import android.os.BatteryManager
+
+          class BgView(c: Context) : View(c) {
+              private val p = Paint()
+              private val ph = FloatArray(3000) { (Math.random() * 6.28).toFloat() }
+              var playing = false
+              var boost = 0f
+              var starsEnabled = true
+              var motionEnabled = true
+              var intensity = 70
+              override fun onDraw(cv: Canvas) {
+                  val t = if (motionEnabled) SystemClock.uptimeMillis() / 1000f else 0f
+                  val d = resources.displayMetrics.density
+                  val s = 34 * d; val g = 4 * d
+                  val cols = (width / (s + g)).toInt() + 1; val rows = (height / (s + g)).toInt() + 1
+                  val pulse = if (playing) (.35f + .65f * abs(sin(t * 2.4f))) * (.3f + boost) else 0f
+                  for (y in 0 until rows) for (x in 0 until cols) {
+                      val v = .5f + .5f * sin(t * .8f + ph[(y * cols + x) % ph.size])
+                      val w = .5f + .5f * sin(x * .35f + y * .25f - t * 4f)
+                      val a = ((.025f + .07f * v + pulse * .35f * w) * intensity / 70f).coerceIn(0f,.7f)
+                      val hi = pulse * w > .3f
+                      p.color = Color.argb((a * 255).toInt(), if (hi) 200 else 124, if (hi) 160 else 58, 237)
+                      cv.drawRoundRect(x * (s + g), y * (s + g), x * (s + g) + s, y * (s + g) + s, 4*d, 4*d, p)
+                  }
+                  if (starsEnabled) {
+                      for (i in 0 until 115) {
+                          val x = ((i * 97 + 31) % max(1,width)).toFloat()
+                          val y = ((i * 193 + 71) % max(1,height)).toFloat()
+                          val tw = if (motionEnabled) (.35f + .65f * abs(sin(t * (0.7f + (i%5)*.16f) + ph[i]))) else .65f
+                          p.color = Color.argb((tw * 180).toInt(), 224, 205, 255)
+                          cv.drawCircle(x, y, (if (i%13==0) 1.8f else 1f)*d, p)
+                      }
+                  }
+                  if (motionEnabled) postInvalidateOnAnimation()
+              }
+          }
+
+          @Suppress("DEPRECATION")
+          class MainActivity : Activity() {
+              val uris = ArrayList<Uri>(); val names = ArrayList<String>()
+              var idx = -1; var mp: MediaPlayer? = null
+              var bb: BassBoost? = null; var vz: Virtualizer? = null
+              var eq: Equalizer? = null; var visual: Visualizer? = null
+              var bass = 0; var vir = 0
+              var liveSeconds = 3
+              lateinit var liveLabel: TextView
+              var eqValues = IntArray(10) { 0 }
+              var galaxyHue = 0
+              var jbl = false; var resumeFocus = false
+              var autoProfile = true
+              var sleepFade = false
+              lateinit var ms: MediaSession; lateinit var am: AudioManager
+              lateinit var tTitle: TextView; lateinit var tGain: TextView; lateinit var tInfo: TextView
+              lateinit var tApps: TextView; lateinit var tCount: TextView; lateinit var lib: LinearLayout
+              lateinit var sGain: SeekBar; lateinit var sPos: SeekBar; lateinit var bPlay: Button; lateinit var bg: BgView
+              val h = Handler(Looper.getMainLooper())
+              var pc = 0
+              var pulseAnim: ObjectAnimator? = null
+              val attrs: AudioAttributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build()
+              val acc = 0xFFA855F7.toInt(); val orange = 0xFFFF6A00.toInt()
+
+              fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              fun tv(t: String, sz: Float, c: Int = 0xFFF3E8FF.toInt()) = TextView(this).apply { text = t; textSize = sz; setTextColor(c) }
+              fun btn(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t; setTextColor(Color.WHITE); isAllCaps = false; textSize = 14f
+                  background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(0xFF5B21B6.toInt()) }
+                  setOnClickListener { f() }
+                  layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(3), dp(3), dp(3), dp(3)) }
+              }
+              fun row(vararg v: View) = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; v.forEach { addView(it) } }
+              fun card(vararg v: View) = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(12), dp(14), dp(12))
+                  background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(0xCC180A30.toInt()); setStroke(dp(1), 0x55A855F7) }
+                  layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(6), 0, dp(6)) }
+                  v.forEach { addView(it) }
+              }
+              fun sb(max: Int, p: Int, f: (Int) -> Unit) = SeekBar(this).apply {
+                  this.max = max; progress = p
+                  progressTintList = ColorStateList.valueOf(acc); thumbTintList = ColorStateList.valueOf(0xFFD8B4FE.toInt())
+                  setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) { if (u) f(v) }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+              }
+              fun sw(t: String, f: (Boolean) -> Unit) = Switch(this).apply { text = t; setTextColor(0xFFF3E8FF.toInt()); setOnCheckedChangeListener { _, c -> f(c) } }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  Fx.init(this)
+                  liveSeconds = getPreferences(0).getInt("live_seconds", 3)
+                  window.statusBarColor = 0xFF0D0618.toInt(); window.navigationBarColor = 0xFF0D0618.toInt()
+                  am = getSystemService(AUDIO_SERVICE) as AudioManager
+                  bg = BgView(this)
+                  bg.starsEnabled = getPreferences(0).getBoolean("stars", true)
+                  bg.motionEnabled = getPreferences(0).getBoolean("motion", true)
+                  bg.intensity = getPreferences(0).getInt("intensity", 70)
+                  autoProfile = getPreferences(0).getBoolean("autoprofile", true)
+                  val savedEq = getPreferences(0).getString("eq_values", "") ?: ""
+                  if (savedEq.isNotBlank()) savedEq.split(",").take(10).forEachIndexed { i,v -> eqValues[i] = v.toIntOrNull() ?: 0 }
+                  val gal = ImageView(this).apply { setImageResource(R.drawable.galaxy); layoutParams = LinearLayout.LayoutParams(dp(150), dp(150)).apply { gravity = Gravity.CENTER_HORIZONTAL } }
+                  ObjectAnimator.ofFloat(gal, "rotation", 0f, 360f).apply { duration = 40000; repeatCount = ValueAnimator.INFINITE; interpolator = LinearInterpolator(); start() }
+                  tGain = tv("${Fx.gain}%", 54f, 0xFFD8B4FE.toInt()).apply { gravity = Gravity.CENTER; typeface = Typeface.DEFAULT_BOLD }
+                  sGain = sb(500, Fx.gain) { setGain(it) }
+                  tApps = tv("Güçlendirilen uygulama yok. Önce bunu aç, sonra müziği başlat.", 12f, 0xFFA78BCF.toInt())
+                  tTitle = tv("Parça seçilmedi", 15f).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+                  sPos = sb(1000, 0) { mp?.let { m -> m.seekTo(it * m.duration / 1000) } }
+                  bPlay = btn("▶") { toggle() }.also { (it.layoutParams as LinearLayout.LayoutParams).weight = 1.6f; it.textSize = 22f }
+                  tInfo = tv("JBL modu kapalı", 12f, 0xFFA78BCF.toInt())
+                  tCount = tv("Müzikler yükleniyor", 12f, 0xFFA78BCF.toInt())
+                  lib = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val search = EditText(this).apply {
+                      hint = "Şarkı ara"; setHintTextColor(0xFF8B73B3.toInt()); setTextColor(Color.WHITE); isSingleLine = true
+                      addTextChangedListener(object : android.text.TextWatcher {
+                          override fun afterTextChanged(s: android.text.Editable?) { renderLib(s.toString()) }
+                          override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                          override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                      })
+                  }
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(40), dp(14), dp(30))
+                      addView(tv("Galaxy Booster", 22f).apply { gravity = Gravity.CENTER; typeface = Typeface.DEFAULT_BOLD })
+                      addView(gal)
+                      addView(card(tGain, sGain, row(btn("100") { setGain(100) }, btn("200") { setGain(200) }, btn("300") { setGain(300) }, btn("500") { setGain(500) }),
+                          sw("Tüm sistemi güçlendir (deneysel)") { if (!Fx.setGlobal(it)) toast("Bu cihaz desteklemiyor") }, tApps))
+                      addView(card(tTitle, sPos, row(btn("⏮") { prev() }, bPlay, btn("⏭") { next() })))
+                      addView(card(tv("Telefondaki müzikler", 13f, 0xFFA78BCF.toInt()), tCount, search, lib))
+                      addView(card(tv("Efektler (bu uygulamanın çaları)", 13f, 0xFFA78BCF.toInt()), tv("Bas", 12f), sb(1000, 0) { bass = it; applyFx() }, tv("Surround", 12f), sb(1000, 0) { vir = it; applyFx() },
+                          row(btn("15 dk") { sleep(15) }, btn("30 dk") { sleep(30) }, btn("60 dk") { sleep(60) }, btn("Zamanlayıcı kapat") { sleep(0) })))
+                      addView(card(tv("GALAXY SES LABORATUVARI", 15f, 0xFFD8B4FE.toInt()),
+                          tv("10 bantlı ekolayzır", 13f),
+                          row(btn("Flat") { applyPreset("Flat") }, btn("Bass") { applyPreset("Bass") }, btn("Vocal") { applyPreset("Vocal") }, btn("Rock") { applyPreset("Rock") }),
+                          row(btn("Pop") { applyPreset("Pop") }, btn("Jazz") { applyPreset("Jazz") }, btn("Classical") { applyPreset("Classical") }, btn("Kaydet") { saveEqPreset() }), *Array(10) { i ->
+                              LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(tv("Bant ${i+1}", 11f, 0xFFA78BCF.toInt())); addView(sb(200, 100, { v -> eqValues[i] = v - 100; applyEq() })) }
+                          },
+                          sw("Canlı ses görselleştirici") { setVisualizer(it) },
+                          sw("Bass Booster") { bass = if (it) 800 else 0; applyFx() },
+                          sw("3D Surround") { vir = if (it) 800 else 0; applyFx() },
+                          sw("Otomatik ses profili") { toast(if (it) "Kulaklık ve medya profili hazır" else "Otomatik profil kapalı") },
+                          tv("Şarkı sözleri: Bu parça için cihazda kayıtlı söz bulunursa gösterilebilir.", 11f, 0xFFA78BCF.toInt())))
+                      addView(card(tv("KAMERA STÜDYOSU", 15f, 0xFFD8B4FE.toInt()),
+                          tv("Hareketli çekim süresi: $liveSeconds saniye", 12f).also { liveLabel = it },
+                          row(btn("2 sn") { setLive(2) }, btn("3 sn") { setLive(3) }, btn("5 sn") { setLive(5) }, btn("10 sn") { setLive(10) }),
+                          row(btn("Fotoğraf çek") { launchCamera(false) }, btn("Video / Live çekim") { launchCamera(true) }),
+                          tv("Live Photo benzeri kayıt, süreli kısa video olarak kaydedilir. Otomatik öncesi-sonrası kare birleştirme cihaz kamerasına bağlıdır.", 11f, 0xFFA78BCF.toInt())))
+                      addView(card(tv("CİHAZ MERKEZİ", 15f, 0xFFD8B4FE.toInt()),
+                          btn("Cihaz bilgileri") { deviceInfo() }, btn("Pil analizi") { batteryInfo() },
+                          btn("Wi-Fi bağlantı analizi") { wifiInfo() }, btn("İnternet bağlantı testi") { speedTest() },
+                          btn("Bildirim merkezi") { startActivity(Intent("android.settings.APP_NOTIFICATION_SETTINGS").putExtra("android.provider.extra.APP_PACKAGE", packageName)) }))
+                      addView(card(tv("COSMIC STUDIO", 15f, 0xFFD8B4FE.toInt()),
+                          btn("Nebula duvar kâğıdı stüdyosu") { wallpaperStudio() },
+                          btn("Dinamik tema rengi") { galaxyHue = (galaxyHue + 1) % 4; toast("Galaksi teması değiştirildi") },
+                          btn("Cosmic Clock") { toast(java.text.SimpleDateFormat("HH:mm:ss  •  dd.MM.yyyy", java.util.Locale.getDefault()).format(java.util.Date())) },
+                          btn("Not defteri") { notes() }, btn("Uyku zamanlayıcısı") { sleepDialog() },
+                          btn("Ortam sesleri") { toast("Ortam sesi oynatımı için ses dosyaları eklenmeli") },
+                          btn("Galaxy Vault") { vaultInfo() },
+                          btn("Ayarlar ve kişiselleştirme") { settingsDialog() },
+                          btn("Ses profilleri") { profileDialog() },
+                          btn("Sistem paylaşım menüsü") { shareApp() },
+                          btn("Uygulama hakkında") { aboutDialog() },
+                          tv("Ana ekrana saat widget'ı eklemek için uygulama widget listesinden Galaxy Clock'u seç. Hareketli yıldızlar ve tema ayarları uygulama içinde çalışır.", 11f, 0xFFA78BCF.toInt())))
+                      addView(card(sw("JBL modu") { jbl = it; tInfo.setTextColor(if (it) orange else 0xFFA78BCF.toInt()); tInfo.text = if (it) "Açık: 1 basış durdur/devam, 2 sonraki, 3 önceki. Ses +/- güçlendirmeyi değiştirir. Aramada tek basış cevaplar, görüşmede kapatır." else "JBL modu kapalı"; toast(if (it) "JBL modu açık" else "JBL modu kapalı") }, tInfo))
+                  }
+                  setContentView(FrameLayout(this).apply {
+                      setBackgroundColor(0xFF0D0618.toInt()); addView(bg, -1, -1)
+                      addView(ScrollView(this@MainActivity).apply { addView(box) }, -1, -1)
+                  })
+                  for (i in 0 until box.childCount) box.getChildAt(i).apply { alpha = 0f; translationY = dp(30).toFloat(); animate().alpha(1f).translationY(0f).setStartDelay(i * 90L).setDuration(450).start() }
+                  setupSession()
+                  startForegroundService(Intent(this, KeepService::class.java))
+                  requestPermissions(arrayOf(Manifest.permission.READ_PHONE_STATE, Manifest.permission.ANSWER_PHONE_CALLS, "android.permission.POST_NOTIFICATIONS", "android.permission.READ_MEDIA_AUDIO", "android.permission.READ_EXTERNAL_STORAGE"), 1)
+                  h.post(object : Runnable { override fun run() {
+                      mp?.let { if (it.isPlaying) sPos.progress = it.currentPosition * 1000 / max(1, it.duration) }
+                      val a = Fx.pkgs.values.map { it.substringAfterLast('.') }.distinct()
+                      if (a.isNotEmpty()) tApps.text = "Güçlendirilen: " + a.joinToString(", ")
+                      h.postDelayed(this, 700)
+                  } })
+              }
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) { loadLib() }
+
+              fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+              fun setGain(v: Int) {
+                  Fx.gain = v.coerceIn(0, 500); sGain.progress = Fx.gain; tGain.text = "${Fx.gain}%"; Fx.apply(); Fx.save(this); applyFx()
+                  tGain.animate().scaleX(1.12f).scaleY(1.12f).setDuration(80).withEndAction { tGain.animate().scaleX(1f).scaleY(1f).setDuration(120).start() }.start()
+                  bg.boost = Fx.gain / 500f
+              }
+              fun applyFx() {
+                  val v = min(Fx.gain, 100) / 100f
+                  mp?.setVolume(v, v)
+                  try { bb?.setStrength(bass.toShort()) } catch (e: Exception) {}
+                  try { vz?.setStrength(vir.toShort()) } catch (e: Exception) {}
+              }
+              fun applyEq() {
+                  try { val e = eq ?: return; val r = e.bandLevelRange; val n = min(10, e.numberOfBands.toInt());
+                      for (i in 0 until n) e.setBandLevel(i.toShort(), (eqValues[i] * (r[1] / 100f)).toInt().coerceIn(r[0].toInt(), r[1].toInt()).toShort())
+                  } catch (ex: Exception) {}
+              }
+              fun setVisualizer(on: Boolean) {
+                  try { visual?.release(); visual = null
+                      if (on && mp != null) { visual = Visualizer(mp!!.audioSessionId).apply { captureSize = Visualizer.getCaptureSizeRange()[1]; setDataCaptureListener(object: Visualizer.OnDataCaptureListener {
+                          override fun onWaveFormDataCapture(v: Visualizer?, data: ByteArray?, rate: Int) { bg.boost = (data?.take(80)?.sumOf { abs(it.toInt()-128) }?.toFloat() ?: 0f) / 10000f }
+                          override fun onFftDataCapture(v: Visualizer?, data: ByteArray?, rate: Int) {}
+                      }, Visualizer.getMaxCaptureRate(), true, false); enabled = true } }
+                  } catch (e: Exception) { toast("Görselleştirici cihazda desteklenmiyor") }
+              }
+              fun applyPreset(name: String) {
+                  val values = when(name) {
+                      "Bass" -> intArrayOf(75,65,45,20,0,0,10,20,25,30)
+                      "Vocal" -> intArrayOf(-25,-15,0,30,55,55,35,10,-10,-20)
+                      "Rock" -> intArrayOf(55,35,-5,-20,15,35,55,65,65,60)
+                      "Pop" -> intArrayOf(-5,15,35,45,25,0,-5,5,25,35)
+                      "Jazz" -> intArrayOf(35,20,0,15,-15,-15,0,20,35,45)
+                      "Classical" -> intArrayOf(45,35,25,10,-5,-5,0,20,30,40)
+                      else -> IntArray(10) { 0 }
+                  }
+                  for(i in 0 until 10) eqValues[i] = values[i]
+                  getPreferences(0).edit().putString("eq_preset", name).putString("eq_values", eqValues.joinToString(",")).apply()
+                  applyEq(); toast("$name profili uygulandı")
+              }
+              fun saveEqPreset() {
+                  getPreferences(0).edit().putString("eq_values", eqValues.joinToString(",")).putString("eq_preset", "Custom").apply()
+                  toast("Ekolayzır profilin kaydedildi")
+              }
+              fun settingsDialog() {
+                  val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18),dp(8),dp(18),dp(8)) }
+                  panel.addView(sw("Hareketli yıldız arka planı") { bg.starsEnabled = it })
+                  panel.addView(sw("Animasyonları etkinleştir") { bg.motionEnabled = it; bg.invalidate() })
+                  panel.addView(sw("Galaksi ses tepkisi") { bg.playing = it && mp?.isPlaying == true })
+                  panel.addView(sw("Otomatik ses profili") { autoProfile = it; toast(if(it) "Otomatik profil açık" else "Otomatik profil kapalı") })
+                  panel.addView(tv("Galaksi parlaklığı",13f))
+                  panel.addView(sb(100,bg.intensity) { bg.intensity = it; bg.invalidate() })
+                  val themes = arrayOf("Derin mor","Nebula","Gece siyahı","Menekşe")
+                  panel.addView(btn("Tema: ${themes[galaxyHue % themes.size]}") { galaxyHue=(galaxyHue+1)%themes.size; wallpaperStudio() }.apply { layoutParams = LinearLayout.LayoutParams(-1, dp(48)) })
+                  android.app.AlertDialog.Builder(this).setTitle("Galaxy Booster ayarları").setView(panel).setPositiveButton("Kaydet") { _,_ -> getPreferences(0).edit().putBoolean("stars",bg.starsEnabled).putBoolean("motion",bg.motionEnabled).putInt("intensity",bg.intensity).putBoolean("autoprofile",autoProfile).apply(); toast("Ayarlar kaydedildi") }.setNegativeButton("Kapat",null).show()
+              }
+              fun profileDialog() {
+                  val items = arrayOf("Normal / Flat","Bass ağırlıklı","Konuşma / Vocal","Rock","Pop","Jazz","Classical")
+                  android.app.AlertDialog.Builder(this).setTitle("Ses profili seç").setItems(items) { _,i -> applyPreset(arrayOf("Flat","Bass","Vocal","Rock","Pop","Jazz","Classical")[i]) }.show()
+              }
+              fun shareApp() {
+                  val i = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT,"Galaxy Booster - mor galaksi temalı ses ve kamera merkezi")
+                  startActivity(Intent.createChooser(i,"Paylaş"))
+              }
+              fun aboutDialog() {
+                  android.app.AlertDialog.Builder(this).setTitle("Galaxy Booster Ultimate").setMessage("Sürüm 2.1\nMüzik çalar, ses efektleri, ekolayzır, kamera kısayolları, cihaz araçları ve galaksi kişiselleştirmesi.\n\nSes efektlerinin kullanılabilirliği Android cihazına ve üretici yazılımına bağlıdır.").setPositiveButton("Tamam",null).show()
+              }
+              fun setLive(v: Int) { liveSeconds = v.coerceIn(2,15); getPreferences(0).edit().putInt("live_seconds", liveSeconds).apply(); if (::liveLabel.isInitialized) liveLabel.text = "Hareketli çekim süresi: $liveSeconds saniye"; toast("Hareketli çekim süresi: $liveSeconds saniye") }
+              fun launchCamera(video: Boolean) {
+                  try { val i = Intent(if (video) android.provider.MediaStore.ACTION_VIDEO_CAPTURE else android.provider.MediaStore.ACTION_IMAGE_CAPTURE)
+                      if (video) i.putExtra(android.provider.MediaStore.EXTRA_DURATION_LIMIT, liveSeconds)
+                      startActivityForResult(i, if (video) 902 else 901)
+                  } catch (e: Exception) { toast("Kamera uygulaması açılamadı") }
+              }
+              fun deviceInfo() { toast("${Build.MANUFACTURER} ${Build.MODEL} • Android ${Build.VERSION.RELEASE} • API ${Build.VERSION.SDK_INT}") }
+              fun batteryInfo() { val bm = getSystemService(BATTERY_SERVICE) as BatteryManager; val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY); toast("Pil seviyesi: %$level • Durum: ${if (level <= 20) "Düşük" else "Normal"}") }
+              fun wifiInfo() { try { val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager; val inf = wm.connectionInfo; toast(if (inf.networkId == -1) "Wi-Fi bağlı değil" else "Wi-Fi: ${inf.ssid} • Sinyal: ${WifiManager.calculateSignalLevel(inf.rssi, 5)}/5") } catch (e: Exception) { toast("Wi-Fi bilgisi alınamadı") } }
+              fun speedTest() { toast("Bağlantı testi başlatıldı"); Thread { val start = System.currentTimeMillis(); val result = try { val c = URL("https://clients3.google.com/generate_204").openConnection() as HttpURLConnection; c.connectTimeout = 5000; c.readTimeout = 5000; c.connect(); c.responseCode; c.disconnect(); "Yanıt süresi: ${System.currentTimeMillis()-start} ms" } catch (e: Exception) { "Bağlantı testi başarısız" }; runOnUiThread { toast(result) } }.start() }
+              fun wallpaperStudio() { val colors = arrayOf(0xFF16052E.toInt(),0xFF29105B.toInt(),0xFF3D146B.toInt(),0xFF09051B.toInt()); window.decorView.setBackgroundColor(colors[(System.currentTimeMillis()/1000 % colors.size).toInt()]); toast("Nebula tema varyasyonu uygulandı") }
+              fun notes() { val input = EditText(this).apply { setText(getPreferences(0).getString("notes", "")); minLines = 4; setTextColor(Color.WHITE) }; android.app.AlertDialog.Builder(this).setTitle("Galaxy Notları").setView(input).setPositiveButton("Kaydet") { _, _ -> getPreferences(0).edit().putString("notes", input.text.toString()).apply(); toast("Not kaydedildi") }.setNegativeButton("Kapat", null).show() }
+              fun sleepDialog() { val opts = arrayOf("15 dakika","30 dakika","45 dakika","60 dakika","Zamanlayıcıyı kapat"); android.app.AlertDialog.Builder(this).setTitle("Uyku zamanlayıcısı").setItems(opts) { _, w -> sleep(if (w == 4) 0 else arrayOf(15,30,45,60)[w]) }.show() }
+              fun vaultInfo() { toast("Galaxy Vault: Bu sürümde dosya kasası bilgilendirmesi. Güvenli şifreli kasa için ayrıca şifreleme ve dosya seçici modülü gerekir.") }
+              fun sleep(m: Int) {
+                  h.removeCallbacks(sleepR)
+                  if (m > 0) { h.postDelayed(sleepR, m * 60000L); toast("$m dk sonra durdurulacak") } else toast("Zamanlayıcı kapalı")
+              }
+              val sleepR = Runnable { mp?.pause(); onState() }
+
+              /* Telefondaki müzikleri tara */
+              fun loadLib() {
+                  uris.clear(); names.clear()
+                  val base = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                  val m = MediaStore.Audio.Media.DURATION
+                  try {
+                      contentResolver.query(base, arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST),
+                          "$m>=30000 AND ${MediaStore.Audio.Media.IS_RINGTONE}=0 AND ${MediaStore.Audio.Media.IS_NOTIFICATION}=0 AND ${MediaStore.Audio.Media.IS_ALARM}=0",
+                          null, MediaStore.Audio.Media.DATE_ADDED + " DESC")?.use { c ->
+                          while (c.moveToNext()) {
+                              uris.add(ContentUris.withAppendedId(base, c.getLong(0)))
+                              val a = c.getString(2)
+                              names.add(c.getString(1) + (if (a != null && a != "<unknown>") " - " + a else ""))
+                          }
+                      }
+                  } catch (e: Exception) { toast("Müzik izni gerekli") }
+                  renderLib("")
+              }
+              fun renderLib(q: String) {
+                  lib.removeAllViews(); var n = 0
+                  for (i in names.indices) {
+                      if (q.isEmpty() || names[i].contains(q, true)) {
+                          lib.addView(tv(names[i], 14f).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(dp(4), dp(11), dp(4), dp(11)); setOnClickListener { play(i) } })
+                          if (++n >= 40) break
+                      }
+                  }
+                  tCount.text = "${uris.size} şarkı" + if (n >= 40) " (ilk 40 gösteriliyor, aramayı kullan)" else ""
+              }
+
+              fun play(i: Int) {
+                  if (i < 0 || i >= uris.size) return
+                  idx = i
+                  mp?.let { Fx.remove(it.audioSessionId); it.release() }; bb?.release(); vz?.release()
+                  try {
+                      mp = MediaPlayer().apply { setAudioAttributes(attrs); setDataSource(this@MainActivity, uris[i]); prepare(); setOnCompletionListener { next() } }
+                  } catch (e: Exception) { toast("Dosya açılamadı"); return }
+                  val sid = mp!!.audioSessionId
+                  Fx.add(sid, "galaxy.booster")
+                  try { bb = BassBoost(0, sid).also { it.enabled = true } } catch (e: Exception) {}
+                  try { vz = Virtualizer(0, sid).also { it.enabled = true } } catch (e: Exception) {}
+                  try { eq = Equalizer(0, sid).also { it.enabled = true; applyEq() } } catch (e: Exception) { eq = null }
+                  am.requestAudioFocus(AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN).setAudioAttributes(attrs).setOnAudioFocusChangeListener(afl).build())
+                  applyFx(); mp!!.start(); tTitle.text = names[i]
+                  onState()
+              }
+              val afl = AudioManager.OnAudioFocusChangeListener { c ->
+                  when (c) {
+                      AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> if (mp?.isPlaying == true) { mp?.pause(); resumeFocus = true; onState() }
+                      AudioManager.AUDIOFOCUS_GAIN -> if (resumeFocus) { resumeFocus = false; mp?.start(); onState() }
+                      AudioManager.AUDIOFOCUS_LOSS -> { mp?.pause(); onState() }
+                  }
+              }
+              fun toggle() { val m = mp ?: return; if (m.isPlaying) m.pause() else m.start(); onState() }
+              fun next() { if (uris.isNotEmpty()) play((idx + 1) % uris.size) }
+              fun prev() { if ((mp?.currentPosition ?: 0) > 4000) mp?.seekTo(0) else if (uris.isNotEmpty()) play((idx - 1 + uris.size) % uris.size) }
+              fun onState() {
+                  val on = mp?.isPlaying == true
+                  bPlay.text = if (on) "⏸" else "▶"; bg.playing = on
+                  pulseAnim?.cancel()
+                  if (on) pulseAnim = ObjectAnimator.ofPropertyValuesHolder(bPlay, PropertyValuesHolder.ofFloat("scaleX", 1f, 1.08f), PropertyValuesHolder.ofFloat("scaleY", 1f, 1.08f)).apply { duration = 600; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; start() }
+                  else { bPlay.scaleX = 1f; bPlay.scaleY = 1f }
+                  val st = if (on) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
+                  ms.setPlaybackState(PlaybackState.Builder().setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS)
+                      .setState(st, (mp?.currentPosition ?: 0).toLong(), 1f).build())
+              }
+
+              /* JBL modu: kulaklık tuşları */
+              fun setupSession() {
+                  ms = MediaSession(this, "GalaxyBooster")
+                  ms.setCallback(object : MediaSession.Callback() {
+                      override fun onMediaButtonEvent(i: Intent): Boolean {
+                          val e = i.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                          if (e != null && e.action == KeyEvent.ACTION_DOWN && e.repeatCount == 0) runOnUiThread { key(e.keyCode) }
+                          return true
+                      }
+                  })
+                  ms.isActive = true
+                  onState()
+              }
+              fun key(k: Int) {
+                  when (k) {
+                      KeyEvent.KEYCODE_VOLUME_UP -> if (jbl) setGain(Fx.gain + 10)
+                      KeyEvent.KEYCODE_VOLUME_DOWN -> if (jbl) setGain(Fx.gain - 10)
+                      KeyEvent.KEYCODE_MEDIA_NEXT -> next()
+                      KeyEvent.KEYCODE_MEDIA_PREVIOUS -> prev()
+                      KeyEvent.KEYCODE_MEDIA_STOP -> { mp?.pause(); onState() }
+                      KeyEvent.KEYCODE_HEADSETHOOK, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE ->
+                          if (!jbl) toggle() else if (!callAction()) press()
+                  }
+              }
+              val pressR = Runnable {
+                  val n = pc; pc = 0
+                  when (n) { 1 -> { toggle(); tInfo.text = "1 basış: durdur/devam" }; 2 -> { next(); tInfo.text = "2 basış: sonraki" }; else -> { prev(); tInfo.text = "3 basış: önceki" } }
+              }
+              fun press() { pc++; h.removeCallbacks(pressR); h.postDelayed(pressR, 380) }
+              fun callAction(): Boolean {
+                  try {
+                      if (checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) != PackageManager.PERMISSION_GRANTED) return false
+                      val ts = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
+                      val tm = getSystemService(TELECOM_SERVICE) as TelecomManager
+                      if (ts.callState == TelephonyManager.CALL_STATE_RINGING) { tm.acceptRingingCall(); tInfo.text = "Arama cevaplandı"; return true }
+                      if (ts.callState == TelephonyManager.CALL_STATE_OFFHOOK) { tm.endCall(); tInfo.text = "Arama kapatıldı"; return true }
+                  } catch (e: Exception) {}
+                  return false
+              }
+              override fun onKeyDown(k: Int, e: KeyEvent): Boolean {
+                  if (jbl && (k == KeyEvent.KEYCODE_VOLUME_UP || k == KeyEvent.KEYCODE_VOLUME_DOWN)) { key(k); return true }
+                  return super.onKeyDown(k, e)
+              }
+              override fun onDestroy() { super.onDestroy(); try { visual?.release(); eq?.release() } catch (e: Exception) {}; ms.release(); mp?.release() }
+          }
+          EOF
+
+          pip install pillow -q
+          python3 - <<'PY'
+          import glob
+          from PIL import Image, ImageDraw
+          f=[x for x in glob.glob('galaxy.*') if x.lower().endswith(('jpg','jpeg','png','webp'))]
+          im=Image.open(f[0]).convert('RGB') if f else Image.new('RGB',(512,512),(88,28,180))
+          def circ(s):
+              r=im.resize((s,s),Image.LANCZOS).convert('RGBA')
+              m=Image.new('L',(s*4,s*4),0); ImageDraw.Draw(m).ellipse((0,0,s*4-1,s*4-1),fill=255)
+              r.putalpha(m.resize((s,s),Image.LANCZOS)); return r
+          P='GalaxyBooster/app/src/main/res/'
+          circ(192).save(P+'mipmap-xxxhdpi/ic_launcher.png')
+          circ(512).save(P+'drawable-nodpi/galaxy.png')
+          PY
+      - name: APK derle
+        working-directory: GalaxyBooster
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GalaxyBooster-Ultimate-2.1-APK
+          path: GalaxyBooster/app/build/outputs/apk/debug/*.apk
